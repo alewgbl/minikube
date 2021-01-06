@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 
 	"github.com/pkg/errors"
 	core "k8s.io/api/core/v1"
@@ -34,6 +35,7 @@ import (
 )
 
 const provisionerName = "k8s.io/minikube-hostpath"
+const provisionerAnnotation = "pv.kubernetes.io/provisioned-by"
 
 type hostPathProvisioner struct {
 	// The directory to create PV-backing directories in
@@ -52,18 +54,34 @@ func NewHostPathProvisioner(pvDir string) controller.Provisioner {
 	}
 }
 
-var _ controller.Provisioner = &hostPathProvisioner{}
+var _ controller.Provisioner = new(hostPathProvisioner)
 
 // Provision creates a storage asset and returns a PV object representing it.
 func (p *hostPathProvisioner) Provision(options controller.ProvisionOptions) (*core.PersistentVolume, error) {
-	path := path.Join(p.pvDir, options.PVC.Namespace, options.PVC.Name)
-	klog.Infof("Provisioning volume %v to %s", options, path)
-	if err := os.MkdirAll(path, 0777); err != nil {
+	pvPath := path.Join(p.pvDir, options.PVC.Namespace, options.PVC.Name)
+
+	// SANITY CHECK: If the pvPath already exists then we do not want to overwrite it
+	pvPathFileInfo, err := os.Stat(pvPath)
+	if err != nil {
+		// If the directory doesn't exist, that's good. Otherwise, log an error
+		if !strings.HasSuffix(err.Error(), "no such file or directory") {
+			klog.Errorf("os.Stat(%s) error: %v", pvPath, err)
+		}
+		// Continue on since that is the previous behaviour
+	} else {
+		if pvPathFileInfo.IsDir() {
+			// The PV directory already exists so we do not want to go any further
+			return nil, fmt.Errorf("PV directory %s already exists and we will not overwrite it", pvPath)
+		}
+	}
+
+	klog.Infof("Provisioning volume %v to %s", options, pvPath)
+	if err := os.MkdirAll(pvPath, 0777); err != nil {
 		return nil, err
 	}
 
 	// Explicitly chmod created dir, so we know mode is set to 0777 regardless of umask
-	if err := os.Chmod(path, 0777); err != nil {
+	if err := os.Chmod(pvPath, 0777); err != nil {
 		return nil, err
 	}
 
@@ -82,7 +100,7 @@ func (p *hostPathProvisioner) Provision(options controller.ProvisionOptions) (*c
 			},
 			PersistentVolumeSource: core.PersistentVolumeSource{
 				HostPath: &core.HostPathVolumeSource{
-					Path: path,
+					Path: pvPath,
 				},
 			},
 		},
@@ -95,12 +113,32 @@ func (p *hostPathProvisioner) Provision(options controller.ProvisionOptions) (*c
 // by the given PV.
 func (p *hostPathProvisioner) Delete(volume *core.PersistentVolume) error {
 	klog.Infof("Deleting volume %v", volume)
+
+	// Look up the hostPathProvisionerIdentity
 	ann, ok := volume.Annotations["hostPathProvisionerIdentity"]
 	if !ok {
 		return errors.New("identity annotation not found on PV")
 	}
+	// If our UUID doesn't match the hostPathProvisionerIdentity, then "this" instance
+	// of the provisioner didn't provision the PV. However, there's a good chance that
+	// a Minikube hostpath provisioner was used to provision this volume, so let's check
+	// for that.
 	if ann != string(p.identity) {
-		return &controller.IgnoredError{Reason: "identity annotation on PV does not match ours"}
+		pvProvisioner, ok := volume.Annotations[provisionerAnnotation]
+		if !ok {
+			return fmt.Errorf("%s annotation not found on PV", provisionerAnnotation)
+		}
+		// Check if the volume was provisioned on a node of the same name as the one we're on
+		if pvProvisioner != provisionerName {
+			// The volume wasn't provisioned by this kind of provisioner; do nothing further
+			return &controller.IgnoredError{
+				Reason: fmt.Sprintf("volume was provisioned by a %s provisioner but we are a %s provisioner; will not delete the volume", pvProvisioner, provisionerName),
+			}
+		}
+		klog.Infof("identity annotation on PV (%s) did not match ours (%s), but the volume was provisioned by a %s provisioner and that is okay",
+			ann,
+			p.identity,
+			pvProvisioner)
 	}
 
 	if err := os.RemoveAll(volume.Spec.PersistentVolumeSource.HostPath.Path); err != nil {
